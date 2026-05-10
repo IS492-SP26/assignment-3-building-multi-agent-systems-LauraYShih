@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 import os
 import logging
 import asyncio
+import requests
 
 
 class PaperSearchTool:
@@ -74,36 +75,67 @@ class PaperSearchTool:
         self.logger.info(f"Searching papers: {query}")
 
         try:
-            from semanticscholar import SemanticScholar
-            
-            # Initialize Semantic Scholar client
-            sch = SemanticScholar(api_key=self.api_key)
-            
-            # Define fields to retrieve
             fields = kwargs.get("fields", [
                 "paperId", "title", "authors", "year", "abstract",
                 "citationCount", "url", "venue", "openAccessPdf"
             ])
-            
-            # Perform search
-            results = sch.search_paper(
-                query, 
-                limit=self.max_results,
-                fields=fields
+            papers = await asyncio.to_thread(
+                self._search_semantic_scholar_api,
+                query,
+                fields,
+                year_from,
+                year_to,
+                min_citations,
             )
-            
-            # Parse and filter results
-            papers = self._parse_results(results, year_from, year_to, min_citations)
             
             self.logger.info(f"Found {len(papers)} papers")
             return papers
             
-        except ImportError:
-            self.logger.error("semanticscholar library not installed. Run: pip install semanticscholar")
-            return []
         except Exception as e:
             self.logger.error(f"Error searching papers: {e}")
             return []
+
+    def _search_semantic_scholar_api(
+        self,
+        query: str,
+        fields: List[str],
+        year_from: Optional[int],
+        year_to: Optional[int],
+        min_citations: int,
+    ) -> List[Dict[str, Any]]:
+        """Search Semantic Scholar directly with a bounded HTTP timeout."""
+        url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        headers = {}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
+        params = {
+            "query": query,
+            "limit": self.max_results,
+            "fields": ",".join(fields),
+        }
+
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        papers = []
+        for paper in data.get("data", []):
+            papers.append({
+                "paper_id": paper.get("paperId"),
+                "title": paper.get("title", "Unknown"),
+                "authors": paper.get("authors", []),
+                "year": paper.get("year"),
+                "abstract": paper.get("abstract", ""),
+                "citation_count": paper.get("citationCount", 0),
+                "url": paper.get("url", ""),
+                "venue": paper.get("venue", ""),
+                "pdf_url": (paper.get("openAccessPdf") or {}).get("url"),
+            })
+
+        papers = self._filter_by_year(papers, year_from, year_to)
+        papers = self._filter_by_citations(papers, min_citations)
+        return papers
 
     async def get_paper_details(self, paper_id: str) -> Dict[str, Any]:
         """

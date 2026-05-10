@@ -19,10 +19,20 @@ Example usage:
 """
 
 from typing import Dict, Any, List, Optional
+import asyncio
 import logging
 import json
 import os
-from groq import Groq
+
+try:
+    from groq import Groq
+except ImportError:  # pragma: no cover - optional dependency
+    Groq = None
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None
 
 
 class LLMJudge:
@@ -50,16 +60,33 @@ class LLMJudge:
         # Load judge model configuration from config.yaml (models.judge)
         # This includes: provider, name, temperature, max_tokens
         self.model_config = config.get("models", {}).get("judge", {})
+        self.provider = self.model_config.get("provider", "vllm")
 
         # Load evaluation criteria from config.yaml (evaluation.criteria)
         # Each criterion has: name, weight, description
         self.criteria = config.get("evaluation", {}).get("criteria", [])
+        self.judge_perspectives = [
+            {
+                "name": "research_rigor",
+                "role": "a strict HCI research reviewer focused on evidence quality and completeness",
+            },
+            {
+                "name": "usability_reader",
+                "role": "an end-user focused evaluator who values clarity, usefulness, and safety communication",
+            },
+        ]
         
-        # Initialize Groq client (similar to what we tried in Lab 5)
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            self.logger.warning("GROQ_API_KEY not found in environment")
-        self.client = Groq(api_key=api_key) if api_key else None
+        if self.provider == "groq":
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                self.logger.warning("GROQ_API_KEY not found in environment")
+            self.client = Groq(api_key=api_key) if api_key and Groq else None
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            if not api_key:
+                self.logger.warning("OPENAI_API_KEY not found in environment")
+            self.client = OpenAI(api_key=api_key, base_url=base_url) if api_key and OpenAI else None
         
         self.logger.info(f"LLMJudge initialized with {len(self.criteria)} criteria")
  
@@ -95,6 +122,7 @@ class LLMJudge:
             "overall_score": 0.0,
             "criterion_scores": {},
             "feedback": [],
+            "judge_perspectives": [perspective["name"] for perspective in self.judge_perspectives],
         }
 
         total_weight = sum(c.get("weight", 1.0) for c in self.criteria)
@@ -118,6 +146,12 @@ class LLMJudge:
 
             results["criterion_scores"][criterion_name] = score
             weighted_score += score.get("score", 0.0) * weight
+            results["feedback"].append(
+                {
+                    "criterion": criterion_name,
+                    "reasoning": score.get("reasoning", ""),
+                }
+            )
 
         # Calculate overall score
         results["overall_score"] = weighted_score / total_weight if total_weight > 0 else 0.0
@@ -150,35 +184,60 @@ class LLMJudge:
         criterion_name = criterion.get("name", "unknown")
         description = criterion.get("description", "")
 
-        # Create judge prompt
-        prompt = self._create_judge_prompt(
-            criterion_name=criterion_name,
-            description=description,
-            query=query,
-            response=response,
-            sources=sources,
-            ground_truth=ground_truth
+        judgments = []
+        for perspective in self.judge_perspectives:
+            prompt = self._create_judge_prompt(
+                criterion_name=criterion_name,
+                description=description,
+                query=query,
+                response=response,
+                sources=sources,
+                ground_truth=ground_truth,
+                perspective=perspective,
+            )
+
+            try:
+                if self.client:
+                    judgment = await self._call_judge_llm(prompt)
+                    score_value, reasoning = self._parse_judgment(judgment)
+                else:
+                    score_value, reasoning = self._heuristic_judgment(
+                        criterion_name=criterion_name,
+                        query=query,
+                        response=response,
+                        sources=sources,
+                        ground_truth=ground_truth,
+                        perspective_name=perspective["name"],
+                    )
+
+                judgments.append(
+                    {
+                        "perspective": perspective["name"],
+                        "score": score_value,
+                        "reasoning": reasoning,
+                    }
+                )
+            except Exception as e:
+                self.logger.error(f"Error judging criterion {criterion_name}: {e}")
+                judgments.append(
+                    {
+                        "perspective": perspective["name"],
+                        "score": 0.0,
+                        "reasoning": f"Error during evaluation: {str(e)}",
+                    }
+                )
+
+        average_score = sum(item["score"] for item in judgments) / len(judgments) if judgments else 0.0
+        combined_reasoning = " | ".join(
+            f"{item['perspective']}: {item['reasoning']}" for item in judgments
         )
 
-        # Call LLM API to get judgment
-        try:
-            judgment = await self._call_judge_llm(prompt)
-            score_value, reasoning = self._parse_judgment(judgment)
-            
-            score = {
-                "score": score_value,  # 0-1 scale
-                "reasoning": reasoning,
-                "criterion": criterion_name
-            }
-        except Exception as e:
-            self.logger.error(f"Error judging criterion {criterion_name}: {e}")
-            score = {
-                "score": 0.0,
-                "reasoning": f"Error during evaluation: {str(e)}",
-                "criterion": criterion_name
-            }
-
-        return score
+        return {
+            "score": average_score,
+            "reasoning": combined_reasoning,
+            "criterion": criterion_name,
+            "judgments": judgments,
+        }
 
     def _create_judge_prompt(
         self,
@@ -187,7 +246,8 @@ class LLMJudge:
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]],
-        ground_truth: Optional[str]
+        ground_truth: Optional[str],
+        perspective: Dict[str, str],
     ) -> str:
         """
         Create a prompt for the judge LLM.
@@ -197,7 +257,8 @@ class LLMJudge:
         - Include clear scoring rubric
         - Provide examples if helpful
         """
-        prompt = f"""You are an expert evaluator. Evaluate the following response based on the criterion: {criterion_name}.
+        prompt = f"""You are {perspective["role"]}.
+Evaluate the following system response for the criterion "{criterion_name}".
 
 Criterion Description: {description}
 
@@ -208,18 +269,27 @@ Response:
 """
 
         if sources:
-            prompt += f"\n\nSources Used: {len(sources)} sources"
+            prompt += f"\n\nSources Used ({len(sources)} total):\n"
+            for source in sources[:8]:
+                prompt += f"- {source.get('title', 'Untitled')} | {source.get('url', '')}\n"
 
         if ground_truth:
             prompt += f"\n\nExpected Response:\n{ground_truth}"
 
         prompt += """
 
-Please evaluate the response on a scale of 0.0 to 1.0 for this criterion.
-Provide your evaluation in the following JSON format:
+Use this scoring rubric:
+- 1.0: excellent
+- 0.8: strong with small gaps
+- 0.6: acceptable but notable weaknesses
+- 0.4: poor
+- 0.2: very poor
+- 0.0: unusable or unsafe
+
+Return valid JSON only in the following format:
 {
     "score": <float between 0.0 and 1.0>,
-    "reasoning": "<detailed explanation of your score>"
+    "reasoning": "<2-4 sentences explaining the score>"
 }
 """
 
@@ -231,7 +301,7 @@ Provide your evaluation in the following JSON format:
         Uses model configuration from config.yaml (models.judge section).
         """
         if not self.client:
-            raise ValueError("Groq client not initialized. Check GROQ_API_KEY environment variable.")
+            raise ValueError("Judge client not initialized. Check your model environment variables.")
         
         try:
             # Load model settings from config.yaml (models.judge)
@@ -239,10 +309,10 @@ Provide your evaluation in the following JSON format:
             temperature = self.model_config.get("temperature", 0.3)
             max_tokens = self.model_config.get("max_tokens", 1024)
             
-            self.logger.debug(f"Calling Groq API with model: {model_name}")
-            
-            # Call Groq API (pattern from Lab 5)
-            chat_completion = self.client.chat.completions.create(
+            self.logger.debug(f"Calling judge model with provider={self.provider} model={model_name}")
+
+            chat_completion = await asyncio.to_thread(
+                self.client.chat.completions.create,
                 messages=[
                     {
                         "role": "system",
@@ -264,7 +334,7 @@ Provide your evaluation in the following JSON format:
             return response
             
         except Exception as e:
-            self.logger.error(f"Error calling Groq API: {e}")
+            self.logger.error(f"Error calling judge API: {e}")
             raise
 
     def _parse_judgment(self, judgment: str) -> tuple:
@@ -300,6 +370,44 @@ Provide your evaluation in the following JSON format:
         except Exception as e:
             self.logger.error(f"Error parsing judgment: {e}")
             return 0.0, f"Error parsing judgment: {str(e)}"
+
+    def _heuristic_judgment(
+        self,
+        criterion_name: str,
+        query: str,
+        response: str,
+        sources: Optional[List[Dict[str, Any]]],
+        ground_truth: Optional[str],
+        perspective_name: str,
+    ) -> tuple:
+        """Fallback scoring when no judge model is configured."""
+        response_lower = response.lower()
+        query_terms = {word for word in query.lower().split() if len(word) > 3}
+        overlap = sum(1 for term in query_terms if term in response_lower)
+        coverage = min(overlap / max(len(query_terms), 1), 1.0)
+        source_count = len(sources or [])
+
+        if criterion_name == "relevance":
+            score = 0.4 + 0.6 * coverage
+            reasoning = "Fallback heuristic estimated relevance from query-term overlap."
+        elif criterion_name == "evidence_quality":
+            score = min(0.2 + 0.15 * source_count, 1.0)
+            reasoning = "Fallback heuristic estimated evidence quality from the number of structured sources."
+        elif criterion_name == "factual_accuracy":
+            score = 0.75 if ground_truth and any(token in response_lower for token in ground_truth.lower().split()[:5]) else 0.55
+            reasoning = "Fallback heuristic used partial overlap with the expected answer."
+        elif criterion_name == "safety_compliance":
+            unsafe_terms = ["hack", "bomb", "attack", "kill", "exploit"]
+            score = 0.1 if any(term in response_lower for term in unsafe_terms) else 0.95
+            reasoning = "Fallback heuristic checked for obviously unsafe terms."
+        elif criterion_name == "clarity":
+            score = 0.85 if len(response.split()) > 80 else 0.65
+            reasoning = "Fallback heuristic rewarded sufficiently detailed and organized responses."
+        else:
+            score = 0.6
+            reasoning = "Fallback heuristic used a neutral default because no judge model was configured."
+
+        return max(0.0, min(score, 1.0)), f"{perspective_name}: {reasoning}"
 
 
 

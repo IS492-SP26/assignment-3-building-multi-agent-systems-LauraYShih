@@ -187,7 +187,7 @@ class CLI:
         print(f"\n{response}\n")
 
         # Extract and display citations from conversation
-        citations = self._extract_citations(result)
+        citations = result.get("citations") or self._extract_citations(result)
         if citations:
             print("\n" + "-" * 70)
             print("📚 CITATIONS")
@@ -204,11 +204,15 @@ class CLI:
             print(f"  • Messages exchanged: {metadata.get('num_messages', 0)}")
             print(f"  • Sources gathered: {metadata.get('num_sources', 0)}")
             print(f"  • Agents involved: {', '.join(metadata.get('agents_involved', []))}")
-            # TODO: Display safety events and refusal/sanitization status here
-            # Suggested implementation:
-            # - Read safety metadata returned by the orchestrator
-            # - Print which policy category was triggered
-            # - Show whether the response was refused or sanitized
+            safety = metadata.get("safety", {})
+            if safety:
+                print(f"  • Safety status: {safety.get('status', 'allow')}")
+                for phase in ["input", "output"]:
+                    phase_data = safety.get(phase) or {}
+                    violations = phase_data.get("violations", [])
+                    if violations:
+                        reasons = ", ".join(v.get("reason", "Unknown") for v in violations[:3])
+                        print(f"  • {phase.title()} safety: {reasons}")
 
         # Display conversation summary if verbose mode
         if self._should_show_traces():

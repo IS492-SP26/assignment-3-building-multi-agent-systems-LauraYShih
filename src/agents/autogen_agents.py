@@ -12,13 +12,9 @@ import os
 from typing import Dict, Any, List, Optional
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.conditions import TextMentionTermination
-from autogen_core.tools import FunctionTool
+from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_core.models import ModelFamily
-# Import our research tools
-from src.tools.web_search import web_search
-from src.tools.paper_search import paper_search
 
 
 def create_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
@@ -151,11 +147,11 @@ def create_researcher_agent(config: Dict[str, Any], model_client: OpenAIChatComp
     # Load system prompt from config or use default
     default_system_message = """You are a Research Assistant. Your job is to gather high-quality information from academic papers and web sources.
 
-You have access to tools for web search and paper search. When conducting research:
-1. Use both web search and paper search for comprehensive coverage
-2. Look for recent, high-quality sources
-3. Extract key findings, quotes, and data
-4. Note all source URLs and citations
+The orchestrator may provide you with retrieved web and paper evidence directly in the conversation context. When conducting research:
+1. Prioritize the provided evidence block and cite real URLs from it
+2. Look for recent, high-quality sources and identify the strongest supporting evidence
+3. Extract key findings, quotes, and data relevant to the query
+4. Preserve source titles and URLs exactly as given
 5. Gather evidence that directly addresses the research query"""
 
     # Use custom prompt from config if available
@@ -165,23 +161,12 @@ You have access to tools for web search and paper search. When conducting resear
     else:
         system_message = default_system_message
 
-    # Wrap tools in FunctionTool
-    web_search_tool = FunctionTool(
-        web_search,
-        description="Search the web for articles, blog posts, and general information. Returns formatted search results with titles, URLs, and snippets."
-    )
-    
-    paper_search_tool = FunctionTool(
-        paper_search,
-        description="Search academic papers on Semantic Scholar. Returns papers with authors, abstracts, citation counts, and URLs. Use year_from parameter to filter recent papers."
-    )
-
-    # Create the researcher with tool access
+    # We prefetch search evidence in the orchestrator because Groq tool-calling
+    # can be unreliable with the current AutoGen setup.
     researcher = AssistantAgent(
         name="Researcher",
         model_client=model_client,
-        tools=[web_search_tool, paper_search_tool],
-        description="Gathers evidence from web and academic sources using search tools",
+        description="Gathers evidence from prefetched web and academic sources",
         system_message=system_message,
     )
     
@@ -298,8 +283,11 @@ def create_research_team(config: Dict[str, Any]) -> RoundRobinGroupChat:
     writer = create_writer_agent(config, model_client)
     critic = create_critic_agent(config, model_client)
     
-    # Create termination condition
-    termination = TextMentionTermination("TERMINATE")
+    # Create termination condition.
+    # The max-message guard prevents the team from hanging if the critic never emits TERMINATE.
+    max_iterations = config.get("system", {}).get("max_iterations", 10)
+    max_messages = max(8, min(max_iterations * 2, 12))
+    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages)
     
     # Create team with round-robin ordering
     team = RoundRobinGroupChat(

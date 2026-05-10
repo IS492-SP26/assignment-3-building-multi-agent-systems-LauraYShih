@@ -66,7 +66,7 @@ class SystemEvaluator:
 
     async def evaluate_system(
         self,
-        test_queries_path: str = "data/test_queries.json"
+        test_queries_path: str = "data/example_queries.json"
     ) -> Dict[str, Any]:
         """
         Run full system evaluation.
@@ -90,8 +90,11 @@ class SystemEvaluator:
             return {"error": "Evaluation is disabled in configuration"}
         
         self.logger.info("Starting system evaluation")
+        self.results = []
         # Load test queries
         test_queries = self._load_test_queries(test_queries_path)
+        if not test_queries:
+            return {"error": f"No test queries found at {test_queries_path}"}
         self.logger.info(f"Loaded {len(test_queries)} test queries")
 
         # Evaluate each query
@@ -135,13 +138,11 @@ class SystemEvaluator:
         # Run through orchestrator if available
         if self.orchestrator:
             try:
-                # Call orchestrator's process_query method
-                # TODO: YOUR CODE HERE
-                # Need to implement this in their orchestrator
-                response_data = self.orchestrator.process_query(query)
-                
-                # If process_query is async, use:
-                # response_data = await self.orchestrator.process_query(query)
+                process_query = getattr(self.orchestrator, "process_query")
+                if inspect.iscoroutinefunction(process_query):
+                    response_data = await process_query(query)
+                else:
+                    response_data = await asyncio.to_thread(process_query, query)
                 
             except Exception as e:
                 self.logger.error(f"Error processing query through orchestrator: {e}")
@@ -174,7 +175,8 @@ class SystemEvaluator:
             "response": response_data.get("response", ""),
             "evaluation": evaluation,
             "metadata": response_data.get("metadata", {}),
-            "ground_truth": ground_truth
+            "ground_truth": ground_truth,
+            "expected_sources": expected_sources,
         }
 
     def _load_test_queries(self, path: str) -> List[Dict[str, Any]]:
@@ -188,7 +190,10 @@ class SystemEvaluator:
         path_obj = Path(path)
         if not path_obj.exists():
             self.logger.warning(f"Test queries file not found: {path}")
-            return []
+            fallback = Path("data/example_queries.json")
+            if not fallback.exists():
+                return []
+            path_obj = fallback
 
         with open(path_obj, 'r') as f:
             queries = json.load(f)
@@ -263,6 +268,7 @@ class SystemEvaluator:
                 "query": worst_result.get("query", "") if worst_result else "",
                 "score": worst_result.get("evaluation", {}).get("overall_score", 0.0) if worst_result else 0.0
             } if worst_result else None,
+            "error_analysis": self._generate_error_analysis(successful, failed),
             "detailed_results": self.results
         }
 
@@ -307,6 +313,9 @@ class SystemEvaluator:
             f.write("Scores by Criterion:\n")
             for criterion, score in scores.get("by_criterion", {}).items():
                 f.write(f"  {criterion}: {score:.3f}\n")
+            f.write("\nError Analysis:\n")
+            for item in report.get("error_analysis", []):
+                f.write(f"  - {item}\n")
 
         self.logger.info(f"Summary saved to {summary_file}")
 
@@ -334,6 +343,41 @@ class SystemEvaluator:
             json.dump(report_data, f, indent=2)
         
         self.logger.info(f"Report data exported to {output_path}")
+
+    def _generate_error_analysis(
+        self,
+        successful: List[Dict[str, Any]],
+        failed: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Generate compact error-analysis bullets for the final report."""
+        analysis: List[str] = []
+
+        if failed:
+            analysis.append(f"{len(failed)} queries failed due to runtime or provider issues.")
+
+        low_scoring = [
+            result for result in successful
+            if result.get("evaluation", {}).get("overall_score", 0.0) < 0.6
+        ]
+        if low_scoring:
+            analysis.append(
+                f"{len(low_scoring)} successful queries still scored below 0.6 overall, indicating coverage or evidence gaps."
+            )
+
+        weak_evidence = 0
+        for result in successful:
+            evidence = result.get("evaluation", {}).get("criterion_scores", {}).get("evidence_quality", {})
+            if evidence.get("score", 1.0) < 0.6:
+                weak_evidence += 1
+        if weak_evidence:
+            analysis.append(
+                f"{weak_evidence} queries had low evidence-quality scores, suggesting missing citations or weak source grounding."
+            )
+
+        if not analysis:
+            analysis.append("No dominant failure mode was observed in this evaluation run.")
+
+        return analysis
 
 
 async def example_simple_evaluation():

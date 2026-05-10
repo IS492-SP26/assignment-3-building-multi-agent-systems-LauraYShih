@@ -4,6 +4,7 @@ Checks user inputs for safety violations.
 """
 
 from typing import Dict, Any, List
+import re
 
 
 class InputGuardrail:
@@ -25,14 +26,55 @@ class InputGuardrail:
             config: Configuration dictionary
         """
         self.config = config
+        safety_config = config.get("safety", config)
+        system_config = config.get("system", {})
 
-        # TODO: Initialize guardrail framework
-        # Suggested implementation:
-        # - Read safety settings from config.yaml
-        # - Store min/max query length thresholds
-        # - Prepare policy categories such as harmful content,
-        #   prompt injection, and off-topic queries
-        # - Optionally initialize Guardrails AI / NeMo Guardrails here
+        self.topic = system_config.get("topic", "HCI Research")
+        self.min_length = safety_config.get("min_query_length", 10)
+        self.max_length = safety_config.get("max_query_length", 1500)
+        self.allowed_topics = [
+            "hci",
+            "human computer interaction",
+            "user experience",
+            "ux",
+            "ui",
+            "usability",
+            "accessibility",
+            "interaction design",
+            "human-centered",
+            "human centered",
+            "design research",
+            "ai",
+            "education",
+            "healthcare",
+            "mobile",
+            "voice",
+            "ar",
+            "vr",
+            "explainable ai",
+        ]
+        self.harmful_patterns = [
+            r"\b(build|make|create|write)\b.{0,30}\b(malware|ransomware|virus|keylogger)\b",
+            r"\b(hack|exploit|bypass|breach|phish|ddos)\b",
+            r"\b(weapon|bomb|poison)\b",
+            r"\b(steal|dox|harass|stalk)\b",
+        ]
+        self.personal_attack_patterns = [
+            r"\bidiot\b",
+            r"\bstupid\b",
+            r"\bworthless\b",
+            r"\bkill yourself\b",
+        ]
+        self.injection_patterns = [
+            r"ignore (all|any|the) previous instructions",
+            r"forget (all|everything)",
+            r"reveal (your )?(system|developer) prompt",
+            r"act as (system|developer|root)",
+            r"jailbreak",
+            r"sudo",
+            r"system:",
+            r"developer:",
+        ]
 
     def validate(self, query: str) -> Dict[str, Any]:
         """
@@ -51,36 +93,37 @@ class InputGuardrail:
         - Check query length and format
         - Check for off-topic queries
         """
+        normalized_query = query.strip()
+        lowered_query = normalized_query.lower()
         violations = []
 
-        # TODO: Implement actual validation
-        # Suggested implementation:
-        # 1. Normalize the input (strip spaces, lowercase copy for keyword checks)
-        # 2. Add length checks using thresholds from config
-        # 3. Call helper methods like _check_toxic_language(),
-        #    _check_prompt_injection(), and _check_relevance()
-        # 4. Decide whether violations should block, sanitize, or warn
-        # 5. Return both the raw violations and a sanitized_input if applicable
-
-        # Placeholder checks
-        if len(query) < 5:
+        if len(normalized_query) < self.min_length:
             violations.append({
                 "validator": "length",
                 "reason": "Query too short",
-                "severity": "low"
+                "severity": "medium",
+                "category": "invalid_input",
             })
 
-        if len(query) > 2000:
+        if len(normalized_query) > self.max_length:
             violations.append({
                 "validator": "length",
                 "reason": "Query too long",
                 "severity": "medium"
             })
 
+        violations.extend(self._check_toxic_language(lowered_query))
+        violations.extend(self._check_prompt_injection(lowered_query))
+        violations.extend(self._check_relevance(lowered_query))
+
+        blocking_severities = {"high"}
+        should_block = any(v.get("severity") in blocking_severities for v in violations)
+
         return {
-            "valid": len(violations) == 0,
+            "valid": len(violations) == 0 or not should_block,
             "violations": violations,
-            "sanitized_input": query  # Could be modified version
+            "action": "refuse" if should_block else ("warn" if violations else "allow"),
+            "sanitized_input": normalized_query,
         }
 
     def _check_toxic_language(self, text: str) -> List[Dict[str, Any]]:
@@ -94,7 +137,27 @@ class InputGuardrail:
         - Mark clearly unsafe requests as high severity
         """
         violations = []
-        # Implement toxicity check
+
+        for pattern in self.harmful_patterns:
+            if re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+                violations.append({
+                    "validator": "harmful_content",
+                    "reason": "Potentially harmful or abusive request detected",
+                    "severity": "high",
+                    "category": "harmful_content",
+                })
+                break
+
+        for pattern in self.personal_attack_patterns:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                violations.append({
+                    "validator": "personal_attacks",
+                    "reason": "Personal attack or abusive language detected",
+                    "severity": "high",
+                    "category": "personal_attacks",
+                })
+                break
+
         return violations
 
     def _check_prompt_injection(self, text: str) -> List[Dict[str, Any]]:
@@ -122,7 +185,8 @@ class InputGuardrail:
                 violations.append({
                     "validator": "prompt_injection",
                     "reason": f"Potential prompt injection: {pattern}",
-                    "severity": "high"
+                    "severity": "high",
+                    "category": "prompt_injection",
                 })
 
         return violations
@@ -138,5 +202,16 @@ class InputGuardrail:
         - Return low/medium severity violations for off-topic requests
         """
         violations = []
-        # Check if query is about HCI research (or configured topic)
+        if any(keyword in query for keyword in self.allowed_topics):
+            return violations
+
+        violations.append({
+            "validator": "topic_relevance",
+            "reason": (
+                f"Query appears outside the configured topic area ({self.topic}). "
+                "This assistant is intended for HCI-related research questions."
+            ),
+            "severity": "medium",
+            "category": "off_topic_queries",
+        })
         return violations

@@ -39,6 +39,9 @@ def initialize_session_state():
     if 'history' not in st.session_state:
         st.session_state.history = []
 
+    if 'last_result' not in st.session_state:
+        st.session_state.last_result = None
+
     if 'orchestrator' not in st.session_state:
         config = load_config()
         # Initialize AutoGen orchestrator
@@ -84,7 +87,7 @@ async def process_query(query: str) -> Dict[str, Any]:
             return result
         
         # Extract citations from conversation history
-        citations = extract_citations(result)
+        citations = result.get("citations") or extract_citations(result)
         
         # Extract agent traces for display
         agent_traces = extract_agent_traces(result)
@@ -115,6 +118,16 @@ async def process_query(query: str) -> Dict[str, Any]:
 def extract_citations(result: Dict[str, Any]) -> list:
     """Extract citations from research result."""
     citations = []
+    metadata = result.get("metadata", {})
+
+    for citation in result.get("citations", []):
+        if citation and citation not in citations:
+            citations.append(citation)
+
+    for source in metadata.get("sources", []):
+        url = source.get("url")
+        if url and url not in citations:
+            citations.append(url)
     
     # Look through conversation history for citations
     for msg in result.get("conversation_history", []):
@@ -198,15 +211,33 @@ def display_response(result: Dict[str, Any]):
     response = result.get("response", "")
     st.markdown(response)
 
+    metadata = result.get("metadata", {})
+
     # Display citations
     citations = result.get("citations", [])
     if citations:
         with st.expander("📚 Citations", expanded=False):
             for i, citation in enumerate(citations, 1):
-                st.markdown(f"**[{i}]** {citation}")
+                if isinstance(citation, str) and citation.startswith("http"):
+                    st.markdown(f"**[{i}]** [{citation}]({citation})")
+                else:
+                    st.markdown(f"**[{i}]** {citation}")
+
+    sources = metadata.get("sources", [])
+    if sources:
+        with st.expander("🔎 Sources", expanded=False):
+            for i, source in enumerate(sources, 1):
+                title = source.get("title", f"Source {i}")
+                url = source.get("url", "")
+                snippet = source.get("snippet", "")
+                if url:
+                    st.markdown(f"**[{i}] [{title}]({url})**")
+                else:
+                    st.markdown(f"**[{i}] {title}**")
+                if snippet:
+                    st.caption(snippet[:220])
 
     # Display metadata
-    metadata = result.get("metadata", {})
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Sources Used", metadata.get("num_sources", 0))
@@ -251,7 +282,8 @@ def display_agent_traces(traces: Dict[str, Any]):
             for action in actions:
                 action_type = action.get("action_type", "unknown")
                 details = action.get("details", {})
-                st.text(f"  → {action_type}: {details}")
+                st.caption(action_type)
+                st.code(str(details), language="text")
 
 
 def display_sidebar():
@@ -275,15 +307,19 @@ def display_sidebar():
 
         st.title("📊 Statistics")
 
-        # TODO: Get actual statistics
+        safety_event_count = 0
+        for item in st.session_state.history:
+            safety_event_count += len(item.get("result", {}).get("metadata", {}).get("safety_events", []))
+
         st.metric("Total Queries", len(st.session_state.history))
-        st.metric("Safety Events", 0)  # TODO: Get from safety manager
+        st.metric("Safety Events", safety_event_count)
 
         st.divider()
 
         # Clear history button
         if st.button("Clear History"):
             st.session_state.history = []
+            st.session_state.last_result = None
             st.rerun()
 
         # About section
@@ -342,6 +378,7 @@ def main():
                 with st.spinner("Processing your query..."):
                     # Process query
                     result = asyncio.run(process_query(query))
+                    st.session_state.last_result = result
 
                     # Add to history
                     st.session_state.history.append({
@@ -349,12 +386,13 @@ def main():
                         "query": query,
                         "result": result
                     })
-
-                    # Display result
-                    st.divider()
-                    display_response(result)
+                    st.rerun()
             else:
                 st.warning("Please enter a query.")
+
+        if st.session_state.last_result:
+            st.divider()
+            display_response(st.session_state.last_result)
 
         # History
         display_history()
@@ -393,8 +431,20 @@ def main():
     if st.session_state.show_safety_log:
         st.divider()
         st.markdown("### 🛡️ Safety Event Log")
-        # TODO: Display safety events from safety manager
-        st.info("No safety events recorded.")
+        events = []
+        for item in st.session_state.history:
+            events.extend(item.get("result", {}).get("metadata", {}).get("safety_events", []))
+
+        if not events:
+            st.info("No safety events recorded.")
+        else:
+            for event in reversed(events):
+                st.warning(
+                    f"{event.get('timestamp', '')} | {event.get('type', 'unknown')} | "
+                    f"{event.get('action', 'allow')}"
+                )
+                for violation in event.get("violations", []):
+                    st.caption(violation.get("reason", "Unknown violation"))
 
 
 if __name__ == "__main__":

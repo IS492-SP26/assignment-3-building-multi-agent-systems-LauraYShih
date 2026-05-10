@@ -27,12 +27,13 @@ class OutputGuardrail:
             config: Configuration dictionary
         """
         self.config = config
-
-        # TODO: Initialize guardrail framework
-        # Suggested implementation:
-        # - Read output safety settings from config
-        # - Decide which checks should block vs sanitize
-        # - Optionally initialize Guardrails AI / NeMo Guardrails validators
+        safety_config = config.get("safety", config)
+        self.block_on_harmful = safety_config.get("block_harmful_output", True)
+        self.redact_pii = safety_config.get("redact_pii", True)
+        self.response_message = safety_config.get(
+            "on_violation",
+            {},
+        ).get("message", "I cannot provide that response due to safety policies.")
 
     def validate(self, response: str, sources: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -54,28 +55,32 @@ class OutputGuardrail:
         """
         violations = []
 
-        # TODO: Implement actual validation
-        # Suggested implementation:
-        # 1. Run helper checks such as _check_pii() and _check_harmful_content()
-        # 2. If sources are available, compare claims/citations against them
-        # 3. Decide whether to redact, refuse, or allow the response
-        # 4. Return sanitized_output for UI display when applicable
-
-        # Placeholder checks
         pii_violations = self._check_pii(response)
         violations.extend(pii_violations)
 
         harmful_violations = self._check_harmful_content(response)
         violations.extend(harmful_violations)
 
+        bias_violations = self._check_bias(response)
+        violations.extend(bias_violations)
+
         if sources:
             consistency_violations = self._check_factual_consistency(response, sources)
             violations.extend(consistency_violations)
 
+        should_block = any(
+            violation.get("severity") == "high" and violation.get("validator") != "pii"
+            for violation in violations
+        )
+        sanitized_output = self._sanitize(response, violations) if violations else response
+        if should_block:
+            sanitized_output = self.response_message
+
         return {
-            "valid": len(violations) == 0,
+            "valid": len(violations) == 0 or not should_block,
             "violations": violations,
-            "sanitized_output": self._sanitize(response, violations) if violations else response
+            "action": "refuse" if should_block else ("sanitize" if violations else "allow"),
+            "sanitized_output": sanitized_output,
         }
 
     def _check_pii(self, text: str) -> List[Dict[str, Any]]:
@@ -105,7 +110,8 @@ class OutputGuardrail:
                     "pii_type": pii_type,
                     "reason": f"Contains {pii_type}",
                     "severity": "high",
-                    "matches": matches
+                    "matches": matches,
+                    "category": "pii",
                 })
 
         return violations
@@ -123,13 +129,20 @@ class OutputGuardrail:
         violations = []
 
         # Placeholder - should use proper toxicity detection
-        harmful_keywords = ["violent", "harmful", "dangerous"]
+        harmful_keywords = [
+            "how to build a bomb",
+            "how to hack",
+            "kill them",
+            "violent attack",
+            "bypass the law",
+        ]
         for keyword in harmful_keywords:
             if keyword in text.lower():
                 violations.append({
                     "validator": "harmful_content",
                     "reason": f"May contain harmful content: {keyword}",
-                    "severity": "medium"
+                    "severity": "high",
+                    "category": "harmful_content",
                 })
 
         return violations
@@ -149,9 +162,34 @@ class OutputGuardrail:
         - Optionally use an LLM-based verifier or a citation-grounding check
         """
         violations = []
+        if not sources:
+            return violations
 
-        # Placeholder - this is complex and could use LLM
-        # to verify claims against sources
+        response_lower = response.lower()
+        cited_urls = {
+            source.get("url", "").strip()
+            for source in sources
+            if isinstance(source, dict) and source.get("url")
+        }
+
+        claimed_urls = set(re.findall(r"https?://[^\s<>{}\[\]]+", response))
+        missing_urls = claimed_urls - cited_urls
+        if missing_urls:
+            violations.append({
+                "validator": "factual_consistency",
+                "reason": "Response cites URLs that were not present in retrieved sources",
+                "severity": "medium",
+                "category": "misinformation",
+                "matches": sorted(missing_urls),
+            })
+
+        if "according to the sources" in response_lower and not cited_urls:
+            violations.append({
+                "validator": "factual_consistency",
+                "reason": "Response claims source support but no structured sources were provided",
+                "severity": "medium",
+                "category": "misinformation",
+            })
 
         return violations
 
@@ -165,7 +203,23 @@ class OutputGuardrail:
         - Decide whether to redact, revise, or refuse the output
         """
         violations = []
-        # Implement bias detection
+        biased_phrases = [
+            "all people from",
+            "naturally inferior",
+            "genetically better",
+            "those people are",
+        ]
+
+        lowered = text.lower()
+        for phrase in biased_phrases:
+            if phrase in lowered:
+                violations.append({
+                    "validator": "bias",
+                    "reason": f"Potential biased or discriminatory phrasing detected: {phrase}",
+                    "severity": "high",
+                    "category": "bias",
+                })
+                break
         return violations
 
     def _sanitize(self, text: str, violations: List[Dict[str, Any]]) -> str:
@@ -185,5 +239,9 @@ class OutputGuardrail:
             if violation.get("validator") == "pii":
                 for match in violation.get("matches", []):
                     sanitized = sanitized.replace(match, "[REDACTED]")
+
+        for violation in violations:
+            if violation.get("validator") == "harmful_content":
+                return self.response_message
 
         return sanitized
